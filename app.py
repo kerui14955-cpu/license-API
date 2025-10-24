@@ -31,48 +31,49 @@ def verify_key():
     data = request.get_json()
     key = data.get('key')
     hwid = data.get('hwid')
+    # 【新增】从客户端获取脚本ID
+    script_id = data.get('script_id')
 
-    if not key or not hwid:
-        return jsonify({"status": "failure", "message": "缺少 key 或 hwid 参数"}), 400
+    if not key or not hwid or not script_id:
+        return jsonify({"status": "failure", "message": "缺少 key, hwid 或 script_id 参数"}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # 假设您的数据库表名为 LicenseKeys (与LeanCloud一致)
-    cur.execute("SELECT hwid, \"expireAt\" FROM \"LicenseKeys\" WHERE key = %s", (key,))
+    # 【修改】查询语句增加了 "script_type"
+    cur.execute('SELECT hwid, "expireAt", "script_type" FROM "LicenseKeys" WHERE key = %s', (key,))
     result = cur.fetchone()
     
-    # 检查授权是否过期 (和您的桌面程序逻辑保持一致)
     if result:
-        stored_hwid, expires_at = result
+        stored_hwid, expires_at, stored_script_type = result
+        
+        # 【新增】检查卡密类型是否匹配
+        if stored_script_type != script_id:
+            cur.close()
+            conn.close()
+            return jsonify({"status": "failure", "message": "卡密类型不匹配，无法用于此脚本"}), 200
+
+        # 后续的过期检查和硬件ID绑定逻辑保持不变...
         if expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
             cur.close()
             conn.close()
             return jsonify({"status": "failure", "message": "授权已过期"}), 200
 
-        # 首次绑定逻辑
+        expires_at_iso = expires_at.isoformat().replace('+00:00', 'Z')
         if stored_hwid is None:
-            cur.execute("UPDATE \"LicenseKeys\" SET hwid = %s WHERE key = %s", (hwid, key))
+            cur.execute('UPDATE "LicenseKeys" SET hwid = %s WHERE key = %s', (hwid, key))
             conn.commit()
-            expires_at_iso = expires_at.isoformat().replace('+00:00', 'Z')
-            cur.close()
-            conn.close()
-            return jsonify({"status": "success", "message": "绑定成功", "expires_at": expires_at_iso}), 200
-
-        # 验证逻辑
-        if stored_hwid == hwid:
-            expires_at_iso = expires_at.isoformat().replace('+00:00', 'Z')
-            cur.close()
-            conn.close()
-            return jsonify({"status": "success", "message": "验证成功", "expires_at": expires_at_iso}), 200
+            message = {"status": "success", "message": "绑定成功", "expires_at": expires_at_iso}
+        elif stored_hwid == hwid:
+            message = {"status": "success", "message": "验证成功", "expires_at": expires_at_iso}
         else:
-            cur.close()
-            conn.close()
-            return jsonify({"status": "failure", "message": "硬件ID不匹配"}), 200
+            message = {"status": "failure", "message": "硬件ID不匹配"}
     else:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "failure", "message": "卡密无效"}), 200
+        message = {"status": "failure", "message": "卡密无效"}
+
+    cur.close()
+    conn.close()
+    return jsonify(message), 200
 
 
 # --- API 端点 2: 解绑硬件 ---
