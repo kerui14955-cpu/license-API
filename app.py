@@ -1,9 +1,9 @@
-# 文件: app.py (【最终合并版 V2】 - 适配您现有的 user 和 game_account_log 表)
+# 文件: app.py (【明文密码版】 - 警告：此版本安全性较低)
 import os
 from flask import Flask, request, jsonify
 import psycopg2
 from datetime import datetime, timezone
-import hashlib
+# import hashlib # 【已移除】我们不再需要哈希库
 
 app = Flask(__name__)
 
@@ -19,7 +19,6 @@ def get_db_connection():
 # ===================================================================
 #  K7 / 91 脚本的授权 API (这部分保持不变)
 # ===================================================================
-
 @app.route('/verify', methods=['POST'])
 def verify_key():
     if request.headers.get('X-API-Key') != MASTER_KEY:
@@ -62,7 +61,7 @@ def unbind_key():
     return jsonify(message), 200
 
 # ===================================================================
-#  充值客户端的 API (【已修正】适配您现有的数据库表)
+#  充值客户端的 API (【已修改】使用明文密码)
 # ===================================================================
 
 @app.route('/api/create_user', methods=['POST'])
@@ -72,14 +71,15 @@ def create_user():
     if not license_key or not password:
         return jsonify({"status": "failure", "message": "卡密和密码不能为空"}), 400
     
-    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    # 【已修改】不再对密码进行哈希，直接使用原始密码
+    password_to_store = password
     
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute(
             'INSERT INTO "user" (license_key, password) VALUES (%s, %s)',
-            (license_key, password_hash)
+            (license_key, password_to_store) # <-- 存储明文密码
         )
         conn.commit()
         return jsonify({"status": "success", "message": f"用户 {license_key} 创建成功"}), 201
@@ -99,7 +99,7 @@ def login():
     if not license_key or not password:
         return jsonify({"status": "failure", "message": "卡密和密码不能为空"}), 400
     
-    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    # 【已修改】不再对传入的密码进行哈希
     
     conn = get_db_connection()
     cur = conn.cursor()
@@ -107,39 +107,33 @@ def login():
     user = cur.fetchone()
     cur.close(); conn.close()
     
-    if user and user[0] == password_hash:
+    # 【已修改】直接比较传入的明文密码和数据库中存储的明文密码
+    if user and user[0] == password:
         return jsonify({"status": "success", "message": "登录成功", "user": {"license_key": license_key}}), 200
     else:
         return jsonify({"status": "failure", "message": "卡密或密码错误"}), 401
 
 @app.route('/api/log_recharge', methods=['POST'])
 def log_recharge_entry():
-    """【最终修正】此函数现在会向您现有的 'game_account_log' 表写入数据"""
+    # 这个函数不受密码影响，保持不变
     data = request.get_json()
     license_key, game_account = data.get('license_key'), data.get('game_account')
     if not license_key or not game_account:
         return jsonify({"status": "failure", "message": "缺少 license_key 或 game_account"}), 400
-    
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # 步骤1: 先根据 license_key 查找 user_id
         cur.execute('SELECT id FROM "user" WHERE license_key = %s', (license_key,))
         user_record = cur.fetchone()
-        
         if not user_record:
             return jsonify({"status": "failure", "message": "记录失败：找不到对应的用户卡密"}), 404
-        
         user_id = user_record[0]
-
-        # 【最终修正】步骤2: 使用查到的 user_id 和 account_name 插入到您正确的 "game_account_log" 表
         cur.execute(
             'INSERT INTO "game_account_log" (user_id, account_name) VALUES (%s, %s)',
             (user_id, game_account)
         )
         conn.commit()
         return jsonify({"status": "success", "message": "日志记录成功"}), 200
-        
     except Exception as e:
         conn.rollback()
         return jsonify({"status": "failure", "message": f"服务器内部错误: {e}"}), 500
