@@ -1,9 +1,8 @@
-# 文件: app.py (【明文密码版】 - 警告：此版本安全性较低)
+# 文件: app.py (【已修改】 - 支持首次激活)
 import os
 from flask import Flask, request, jsonify
 import psycopg2
-from datetime import datetime, timezone
-# import hashlib # 【已移除】我们不再需要哈希库
+from datetime import datetime, timezone, timedelta # 【新增】导入 timedelta
 
 app = Flask(__name__)
 
@@ -17,38 +16,109 @@ def get_db_connection():
     return conn
 
 # ===================================================================
-#  K7 / 91 脚本的授权 API (这部分保持不变)
+#  K7 / 91 脚本的授权 API (【已修改】)
 # ===================================================================
+
+# ▼▼▼ 用下面的新版本，完整替换你原来的 verify_key 函数 ▼▼▼
 @app.route('/verify', methods=['POST'])
 def verify_key():
     if request.headers.get('X-API-Key') != MASTER_KEY:
         return jsonify({"status": "failure", "message": "无效的 API 密钥"}), 401
+    
     data = request.get_json()
     key, hwid, script_id = data.get('key'), data.get('hwid'), data.get('script_id')
+    
     if not all([key, hwid, script_id]):
         return jsonify({"status": "failure", "message": "缺少 key, hwid 或 script_id 参数"}), 400
+    
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('SELECT hwid, "expireAt", "script_type" FROM "LicenseKeys" WHERE key = %s', (key,))
+    
+    # 【修改】: 增加 "duration_days" 字段
+    cur.execute(
+        'SELECT hwid, "expireAt", "script_type", "duration_days" FROM "LicenseKeys" WHERE key = %s', 
+        (key,)
+    )
     result = cur.fetchone()
-    message = {}
-    if result:
-        stored_hwid, expires_at, stored_script_type = result
-        if stored_script_type != script_id: message = {"status": "failure", "message": "卡密类型不匹配"}
-        elif expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc): message = {"status": "failure", "message": "授权已过期"}
+    
+    if not result:
+        cur.close(); conn.close()
+        return jsonify({"status": "failure", "message": "卡密无效"}), 200
+
+    # 【修改】: 解包新字段
+    stored_hwid, expires_at, stored_script_type, duration_days = result
+
+    # 检查脚本类型
+    if stored_script_type != script_id:
+        cur.close(); conn.close()
+        return jsonify({"status": "failure", "message": "卡密类型不匹配"}), 200
+
+    # 【核心修改】: 检查激活状态
+    if stored_hwid is None:
+        # --- 首次激活流程 ---
+        print(f"--- 激活请求: 卡密 {key} 正在被 {hwid} 首次激活 ---")
+        
+        # 检查是"时长卡" (duration_days > 0) 还是"即时卡" (duration_days is 0 or None, 但 expireAt 已设置)
+        if duration_days and duration_days > 0:
+            # 这是标准的 "时长卡" 激活
+            new_expire_at = datetime.now(timezone.utc) + timedelta(days=duration_days)
+            
+            cur.execute(
+                'UPDATE "LicenseKeys" SET hwid = %s, "expireAt" = %s WHERE key = %s',
+                (hwid, new_expire_at, key)
+            )
+            conn.commit()
+            print(f"--- 激活成功: {key} 的到期时间设置为 {new_expire_at} ---")
+            
+            expires_at_iso = new_expire_at.isoformat().replace('+00:00', 'Z')
+            message = {"status": "success", "message": f"激活成功，有效期 {duration_days} 天", "expires_at": expires_at_iso}
+        
+        elif expires_at and expires_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc):
+            # 这是 "测试卡" (如1分钟卡)，它有 expireAt 但没有 duration
+            # 只需要绑定 hwid
+            cur.execute(
+                'UPDATE "LicenseKeys" SET hwid = %s WHERE key = %s', 
+                (hwid, key)
+            )
+            conn.commit()
+            print(f"--- 激活成功: {key} (测试卡) 绑定到 {hwid} ---")
+            
+            expires_at_iso = expires_at.isoformat().replace('+00:00', 'Z')
+            message = {"status": "success", "message": "测试卡密绑定成功", "expires_at": expires_at_iso}
+        
+        else:
+            # 卡密既没有 duration_days，也没有有效的 expires_at (可能是已过期的测试卡)
+            message = {"status": "failure", "message": "卡密无效或已过期 (无法激活)"}
+    
+    else:
+        # --- 已激活，常规验证流程 ---
+        
+        # 检查 HWID
+        if stored_hwid != hwid:
+            message = {"status": "failure", "message": "硬件ID不匹配"}
+        
+        # 检查到期时间 (安全检查)
+        elif expires_at is None:
+            message = {"status": "failure", "message": "卡密状态异常 (缺少到期日)"}
+        
+        # 检查到期时间 (常规)
+        elif expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+            message = {"status": "failure", "message": "授权已过期"}
+        
+        # 全部通过
         else:
             expires_at_iso = expires_at.isoformat().replace('+00:00', 'Z')
-            if stored_hwid is None:
-                cur.execute('UPDATE "LicenseKeys" SET hwid = %s WHERE key = %s', (hwid, key)); conn.commit()
-                message = {"status": "success", "message": "绑定成功", "expires_at": expires_at_iso}
-            elif stored_hwid == hwid: message = {"status": "success", "message": "验证成功", "expires_at": expires_at_iso}
-            else: message = {"status": "failure", "message": "硬件ID不匹配"}
-    else: message = {"status": "failure", "message": "卡密无效"}
+            message = {"status": "success", "message": "验证成功", "expires_at": expires_at_iso}
+    
+    # 返回结果
     cur.close(); conn.close()
     return jsonify(message), 200
+# ▲▲▲ 替换结束 ▲▲▲
+
 
 @app.route('/unbind', methods=['POST'])
 def unbind_key():
+    # (此函数保持不变)
     if request.headers.get('X-API-Key') != MASTER_KEY:
         return jsonify({"status": "failure", "message": "无效的 API 密钥"}), 401
     data = request.get_json(); key, hwid = data.get('key'), data.get('hwid')
@@ -61,7 +131,7 @@ def unbind_key():
     return jsonify(message), 200
 
 # ===================================================================
-#  充值客户端的 API (【已修改】使用明文密码)
+#  充值客户端的 API (这部分保持不变)
 # ===================================================================
 
 @app.route('/api/create_user', methods=['POST'])
@@ -71,7 +141,6 @@ def create_user():
     if not license_key or not password:
         return jsonify({"status": "failure", "message": "卡密和密码不能为空"}), 400
     
-    # 【已修改】不再对密码进行哈希，直接使用原始密码
     password_to_store = password
     
     conn = get_db_connection()
@@ -79,7 +148,7 @@ def create_user():
     try:
         cur.execute(
             'INSERT INTO "user" (license_key, password) VALUES (%s, %s)',
-            (license_key, password_to_store) # <-- 存储明文密码
+            (license_key, password_to_store)
         )
         conn.commit()
         return jsonify({"status": "success", "message": f"用户 {license_key} 创建成功"}), 201
@@ -99,15 +168,12 @@ def login():
     if not license_key or not password:
         return jsonify({"status": "failure", "message": "卡密和密码不能为空"}), 400
     
-    # 【已修改】不再对传入的密码进行哈希
-    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute('SELECT password FROM "user" WHERE license_key = %s', (license_key,))
     user = cur.fetchone()
     cur.close(); conn.close()
     
-    # 【已修改】直接比较传入的明文密码和数据库中存储的明文密码
     if user and user[0] == password:
         return jsonify({"status": "success", "message": "登录成功", "user": {"license_key": license_key}}), 200
     else:
@@ -115,7 +181,6 @@ def login():
 
 @app.route('/api/log_recharge', methods=['POST'])
 def log_recharge_entry():
-    # 这个函数不受密码影响，保持不变
     data = request.get_json()
     license_key, game_account = data.get('license_key'), data.get('game_account')
     if not license_key or not game_account:
