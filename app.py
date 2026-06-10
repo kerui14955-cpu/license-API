@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
@@ -9,6 +10,13 @@ app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 MASTER_KEY = os.environ.get("MASTER_KEY")
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
+CLIENT_API_KEY = os.environ.get("CLIENT_API_KEY")
+LEGACY_CLIENT_KEY = os.environ.get("LEGACY_CLIENT_KEY") or MASTER_KEY
+
+AUTH_ADMIN = "admin"
+AUTH_CLIENT = "client"
+AUTH_LEGACY = "legacy"
 
 
 def get_db_connection():
@@ -32,6 +40,101 @@ def iso_z(dt):
     return as_utc(dt).isoformat().replace("+00:00", "Z")
 
 
+def get_request_api_key():
+    return request.headers.get("X-API-Key")
+
+
+def get_api_role():
+    api_key = get_request_api_key()
+    if ADMIN_API_KEY and api_key == ADMIN_API_KEY:
+        return AUTH_ADMIN
+    if CLIENT_API_KEY and api_key == CLIENT_API_KEY:
+        return AUTH_CLIENT
+    if LEGACY_CLIENT_KEY and api_key == LEGACY_CLIENT_KEY:
+        return AUTH_LEGACY
+    return None
+
+
+def require_api_role(*allowed_roles):
+    role = get_api_role()
+    if role in allowed_roles:
+        return role, None
+    return None, (jsonify({"status": "failure", "message": "Unauthorized"}), 401)
+
+
+def get_client_ip():
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr
+
+
+def write_audit(
+    action,
+    license_key=None,
+    old_hwid=None,
+    new_hwid=None,
+    old_expire_at=None,
+    new_expire_at=None,
+    detail=None,
+):
+    """Best-effort audit log. Failures here must never block licensing."""
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS "LicenseAuditLogs" (
+                id SERIAL PRIMARY KEY,
+                action TEXT NOT NULL,
+                license_key TEXT,
+                old_hwid TEXT,
+                new_hwid TEXT,
+                client_ip TEXT,
+                user_agent TEXT,
+                old_expire_at TIMESTAMPTZ,
+                new_expire_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                detail TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO "LicenseAuditLogs"
+                (action, license_key, old_hwid, new_hwid, client_ip, user_agent,
+                 old_expire_at, new_expire_at, created_at, detail)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                action,
+                license_key,
+                old_hwid,
+                new_hwid,
+                get_client_ip(),
+                request.headers.get("User-Agent", ""),
+                old_expire_at,
+                new_expire_at,
+                datetime.now(timezone.utc),
+                json.dumps(detail or {}, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Audit log skipped: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
 def get_hwid_candidates(data):
     old_hwid = data.get("old_hwid")
     old_hwid_candidates = data.get("old_hwid_candidates") or []
@@ -47,15 +150,24 @@ def get_hwid_candidates(data):
 
 @app.route("/verify", methods=["POST"])
 def verify_key():
-    if request.headers.get("X-API-Key") != MASTER_KEY:
-        return jsonify({"status": "failure", "message": "Invalid API key"}), 401
+    role, auth_error = require_api_role(AUTH_ADMIN, AUTH_CLIENT, AUTH_LEGACY)
+    if auth_error:
+        write_audit("verify_unauthorized", detail={"path": request.path})
+        return auth_error
 
     data = request.get_json(silent=True) or {}
     key = data.get("key")
     hwid = data.get("hwid")
     script_id = data.get("script_id")
+    app_version = data.get("app_version")
 
     if not all([key, hwid, script_id]):
+        write_audit(
+            "verify_bad_request",
+            license_key=key,
+            new_hwid=hwid,
+            detail={"role": role, "app_version": app_version},
+        )
         return jsonify({"status": "failure", "message": "Missing key, hwid or script_id"}), 400
 
     conn = get_db_connection()
@@ -72,6 +184,12 @@ def verify_key():
         result = cur.fetchone()
 
         if not result:
+            write_audit(
+                "verify_invalid_key",
+                license_key=key,
+                new_hwid=hwid,
+                detail={"role": role, "script_id": script_id, "app_version": app_version},
+            )
             return jsonify({"status": "failure", "message": "Invalid license key"}), 200
 
         stored_hwid, expires_at, stored_script_type, duration_days = result
@@ -79,6 +197,19 @@ def verify_key():
         now = datetime.now(timezone.utc)
 
         if stored_script_type != script_id:
+            write_audit(
+                "verify_script_mismatch",
+                license_key=key,
+                old_hwid=stored_hwid,
+                new_hwid=hwid,
+                old_expire_at=expires_at,
+                detail={
+                    "role": role,
+                    "script_id": script_id,
+                    "stored_script_type": stored_script_type,
+                    "app_version": app_version,
+                },
+            )
             return jsonify({"status": "failure", "message": "License type mismatch"}), 200
 
         if stored_hwid is None:
@@ -92,6 +223,13 @@ def verify_key():
                     (hwid, new_expire_at, key),
                 )
                 conn.commit()
+                write_audit(
+                    "verify_activated",
+                    license_key=key,
+                    new_hwid=hwid,
+                    new_expire_at=new_expire_at,
+                    detail={"role": role, "duration_days": duration_days, "app_version": app_version},
+                )
                 message = {
                     "status": "success",
                     "message": f"Activated for {duration_days} days",
@@ -106,12 +244,27 @@ def verify_key():
                 )
                 conn.commit()
                 print(f"Re-bound license {key} to {hwid}; expiry preserved: {expires_at}")
+                write_audit(
+                    "verify_rebound",
+                    license_key=key,
+                    new_hwid=hwid,
+                    old_expire_at=expires_at,
+                    new_expire_at=expires_at,
+                    detail={"role": role, "app_version": app_version},
+                )
                 message = {
                     "status": "success",
                     "message": "Bound successfully",
                     "expires_at": iso_z(expires_at),
                 }
             else:
+                write_audit(
+                    "verify_invalid_or_expired_activation",
+                    license_key=key,
+                    new_hwid=hwid,
+                    old_expire_at=expires_at,
+                    detail={"role": role, "duration_days": duration_days, "app_version": app_version},
+                )
                 message = {"status": "failure", "message": "License is invalid or expired"}
 
         else:
@@ -119,10 +272,37 @@ def verify_key():
             is_migrating_hwid = stored_hwid != hwid and stored_hwid in legacy_hwids
 
             if stored_hwid != hwid and not is_migrating_hwid:
+                write_audit(
+                    "verify_hwid_mismatch",
+                    license_key=key,
+                    old_hwid=stored_hwid,
+                    new_hwid=hwid,
+                    old_expire_at=expires_at,
+                    detail={
+                        "role": role,
+                        "legacy_candidates_count": len(legacy_hwids),
+                        "app_version": app_version,
+                    },
+                )
                 message = {"status": "failure", "message": "HWID mismatch"}
             elif expires_at_utc is None:
+                write_audit(
+                    "verify_missing_expiry",
+                    license_key=key,
+                    old_hwid=stored_hwid,
+                    new_hwid=hwid,
+                    detail={"role": role, "app_version": app_version},
+                )
                 message = {"status": "failure", "message": "License state error: missing expiry"}
             elif expires_at_utc < now:
+                write_audit(
+                    "verify_expired",
+                    license_key=key,
+                    old_hwid=stored_hwid,
+                    new_hwid=hwid,
+                    old_expire_at=expires_at,
+                    detail={"role": role, "app_version": app_version},
+                )
                 message = {"status": "failure", "message": "License expired"}
             else:
                 if is_migrating_hwid:
@@ -132,6 +312,25 @@ def verify_key():
                     )
                     conn.commit()
                     print(f"Migrated license {key} from legacy hwid to new hwid")
+                    write_audit(
+                        "verify_hwid_migrated",
+                        license_key=key,
+                        old_hwid=stored_hwid,
+                        new_hwid=hwid,
+                        old_expire_at=expires_at,
+                        new_expire_at=expires_at,
+                        detail={"role": role, "app_version": app_version},
+                    )
+                else:
+                    write_audit(
+                        "verify_success",
+                        license_key=key,
+                        old_hwid=stored_hwid,
+                        new_hwid=hwid,
+                        old_expire_at=expires_at,
+                        new_expire_at=expires_at,
+                        detail={"role": role, "app_version": app_version},
+                    )
                 message = {
                     "status": "success",
                     "message": "Verified successfully",
@@ -142,6 +341,12 @@ def verify_key():
 
     except Exception as e:
         conn.rollback()
+        write_audit(
+            "verify_server_error",
+            license_key=key,
+            new_hwid=hwid,
+            detail={"role": role, "app_version": app_version, "error": str(e)},
+        )
         return jsonify({"status": "failure", "message": str(e)}), 500
     finally:
         cur.close()
@@ -150,14 +355,23 @@ def verify_key():
 
 @app.route("/unbind", methods=["POST"])
 def unbind_key():
-    if request.headers.get("X-API-Key") != MASTER_KEY:
-        return jsonify({"status": "failure", "message": "Invalid API key"}), 401
+    role, auth_error = require_api_role(AUTH_ADMIN, AUTH_CLIENT, AUTH_LEGACY)
+    if auth_error:
+        write_audit("unbind_unauthorized", detail={"path": request.path})
+        return auth_error
 
     data = request.get_json(silent=True) or {}
     key = data.get("key")
     hwid = data.get("hwid")
+    app_version = data.get("app_version")
 
     if not key or not hwid:
+        write_audit(
+            "unbind_bad_request",
+            license_key=key,
+            new_hwid=hwid,
+            detail={"role": role, "app_version": app_version},
+        )
         return jsonify({"status": "failure", "message": "Missing parameters"}), 400
 
     conn = get_db_connection()
@@ -166,12 +380,57 @@ def unbind_key():
 
     cur = conn.cursor()
     try:
-        allowed_hwids = [hwid, *get_hwid_candidates(data)]
+        # Self-service unbind: the provided key and current hwid must match.
+        # This preserves compatibility without letting clients alter expiry dates.
         cur.execute(
-            'UPDATE "LicenseKeys" SET hwid = NULL WHERE key = %s AND hwid = ANY(%s)',
-            (key, allowed_hwids),
+            'SELECT hwid, "expireAt" FROM "LicenseKeys" WHERE key = %s',
+            (key,),
+        )
+        result = cur.fetchone()
+        if not result:
+            write_audit(
+                "unbind_invalid_key",
+                license_key=key,
+                new_hwid=hwid,
+                detail={"role": role, "app_version": app_version},
+            )
+            return jsonify({"status": "failure", "message": "Unbind failed or not found"}), 200
+
+        stored_hwid, expires_at = result
+        if stored_hwid != hwid:
+            write_audit(
+                "unbind_hwid_mismatch",
+                license_key=key,
+                old_hwid=stored_hwid,
+                new_hwid=hwid,
+                old_expire_at=expires_at,
+                detail={"role": role, "app_version": app_version},
+            )
+            return jsonify({"status": "failure", "message": "Unbind failed or not found"}), 200
+
+        cur.execute(
+            'UPDATE "LicenseKeys" SET hwid = NULL WHERE key = %s AND hwid = %s',
+            (key, hwid),
         )
         conn.commit()
+        if cur.rowcount > 0:
+            write_audit(
+                "unbind_success",
+                license_key=key,
+                old_hwid=stored_hwid,
+                old_expire_at=expires_at,
+                new_expire_at=expires_at,
+                detail={"role": role, "app_version": app_version},
+            )
+        else:
+            write_audit(
+                "unbind_noop",
+                license_key=key,
+                old_hwid=stored_hwid,
+                new_hwid=hwid,
+                old_expire_at=expires_at,
+                detail={"role": role, "app_version": app_version},
+            )
         message = (
             {"status": "success", "message": "Unbound successfully"}
             if cur.rowcount > 0
@@ -180,6 +439,12 @@ def unbind_key():
         return jsonify(message), 200
     except Exception as e:
         conn.rollback()
+        write_audit(
+            "unbind_server_error",
+            license_key=key,
+            new_hwid=hwid,
+            detail={"role": role, "app_version": app_version, "error": str(e)},
+        )
         return jsonify({"status": "failure", "message": str(e)}), 500
     finally:
         cur.close()
@@ -193,16 +458,23 @@ def unbind_key():
 
 @app.route("/log_transaction", methods=["POST"])
 def log_transaction():
-    if request.headers.get("X-API-Key") != MASTER_KEY:
-        return jsonify({"status": "failure", "message": "Unauthorized"}), 401
+    role, auth_error = require_api_role(AUTH_ADMIN, AUTH_CLIENT, AUTH_LEGACY)
+    if auth_error:
+        write_audit("transaction_log_unauthorized", detail={"path": request.path})
+        return auth_error
 
     data = request.get_json(silent=True) or {}
     license_key = data.get("license_key")
     client_account = data.get("client_account")
     trans_type = data.get("type")
     amount = data.get("amount")
+    app_version = data.get("app_version")
 
     if not license_key:
+        write_audit(
+            "transaction_log_bad_request",
+            detail={"role": role, "client_account": client_account, "app_version": app_version},
+        )
         return jsonify({"status": "failure", "message": "Missing license key"}), 400
 
     conn = get_db_connection()
@@ -218,10 +490,33 @@ def log_transaction():
             (license_key, client_account, trans_type, amount),
         )
         conn.commit()
+        write_audit(
+            "transaction_log_success",
+            license_key=license_key,
+            detail={
+                "role": role,
+                "client_account": client_account,
+                "transaction_type": trans_type,
+                "amount": amount,
+                "app_version": app_version,
+            },
+        )
         return jsonify({"status": "success", "message": "Log saved successfully"}), 200
     except Exception as e:
         conn.rollback()
         print(f"Failed to save transaction log: {e}")
+        write_audit(
+            "transaction_log_failure",
+            license_key=license_key,
+            detail={
+                "role": role,
+                "client_account": client_account,
+                "transaction_type": trans_type,
+                "amount": amount,
+                "app_version": app_version,
+                "error": str(e),
+            },
+        )
         return jsonify({"status": "failure", "message": str(e)}), 500
     finally:
         cur.close()
