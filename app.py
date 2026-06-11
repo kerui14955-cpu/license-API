@@ -12,11 +12,47 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 MASTER_KEY = os.environ.get("MASTER_KEY")
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 CLIENT_API_KEY = os.environ.get("CLIENT_API_KEY")
-LEGACY_CLIENT_KEY = os.environ.get("LEGACY_CLIENT_KEY") or MASTER_KEY
+TENCENT_SECRET_ID = os.environ.get("TENCENT_SECRET_ID")
+TENCENT_SECRET_KEY = os.environ.get("TENCENT_SECRET_KEY")
+TENCENT_COS_REGION = os.environ.get("TENCENT_COS_REGION", "ap-shanghai")
+TENCENT_COS_BUCKET = os.environ.get("TENCENT_COS_BUCKET")
+TENCENT_COS_LATEST_KEY = os.environ.get("TENCENT_COS_LATEST_KEY", "updates/latest.json")
+UPDATE_URL_EXPIRE_SECONDS = int(os.environ.get("UPDATE_URL_EXPIRE_SECONDS", "600"))
+LEGACY_CLIENT_KEYS = {
+    value.strip()
+    for value in [
+        MASTER_KEY,
+        os.environ.get("LEGACY_CLIENT_KEY"),
+        *os.environ.get("LEGACY_CLIENT_KEYS", "").split(","),
+    ]
+    if value and value.strip()
+}
 
 AUTH_ADMIN = "admin"
 AUTH_CLIENT = "client"
 AUTH_LEGACY = "legacy"
+
+
+def get_cos_client():
+    if not all([TENCENT_SECRET_ID, TENCENT_SECRET_KEY, TENCENT_COS_BUCKET]):
+        raise RuntimeError("Tencent COS environment variables are incomplete")
+
+    from qcloud_cos import CosConfig, CosS3Client
+
+    cos_config = CosConfig(
+        Region=TENCENT_COS_REGION,
+        SecretId=TENCENT_SECRET_ID,
+        SecretKey=TENCENT_SECRET_KEY,
+        Scheme="https",
+    )
+    return CosS3Client(cos_config)
+
+
+def read_update_manifest():
+    client = get_cos_client()
+    response = client.get_object(Bucket=TENCENT_COS_BUCKET, Key=TENCENT_COS_LATEST_KEY)
+    raw = response["Body"].get_raw_stream().read()
+    return json.loads(raw.decode("utf-8"))
 
 
 def get_db_connection():
@@ -50,7 +86,7 @@ def get_api_role():
         return AUTH_ADMIN
     if CLIENT_API_KEY and api_key == CLIENT_API_KEY:
         return AUTH_CLIENT
-    if LEGACY_CLIENT_KEY and api_key == LEGACY_CLIENT_KEY:
+    if api_key in LEGACY_CLIENT_KEYS:
         return AUTH_LEGACY
     return None
 
@@ -146,6 +182,59 @@ def get_hwid_candidates(data):
 # ===================================================================
 # K7 / 91 script license API
 # ===================================================================
+
+
+@app.route("/check_update", methods=["POST"])
+def check_update():
+    role, auth_error = require_api_role(AUTH_ADMIN, AUTH_CLIENT, AUTH_LEGACY)
+    if auth_error:
+        write_audit("check_update_unauthorized", detail={"path": request.path})
+        return auth_error
+
+    data = request.get_json(silent=True) or {}
+    current_version = str(data.get("current_version") or data.get("app_version") or "").strip()
+
+    try:
+        manifest = read_update_manifest()
+        remote_version = str(manifest.get("version") or "").strip()
+        object_key = str(manifest.get("key") or "").strip()
+
+        if not remote_version or not object_key:
+            return jsonify({"status": "failure", "message": "Invalid update manifest"}), 500
+
+        update_available = current_version != remote_version
+        download_url = None
+        if update_available:
+            client = get_cos_client()
+            download_url = client.get_presigned_url(
+                Method="GET",
+                Bucket=TENCENT_COS_BUCKET,
+                Key=object_key,
+                Expired=UPDATE_URL_EXPIRE_SECONDS,
+            )
+
+        return jsonify(
+            {
+                "status": "success",
+                "version": remote_version,
+                "current_version": current_version,
+                "update_available": update_available,
+                "download_url": download_url,
+                "filename": manifest.get("filename"),
+                "key": object_key,
+                "sha256": manifest.get("sha256"),
+                "size": manifest.get("size"),
+                "force": bool(manifest.get("force", False)),
+                "notes": manifest.get("notes", []),
+                "url_expires_in": UPDATE_URL_EXPIRE_SECONDS if download_url else 0,
+            }
+        ), 200
+    except Exception as e:
+        write_audit(
+            "check_update_server_error",
+            detail={"role": role, "current_version": current_version, "error": str(e)},
+        )
+        return jsonify({"status": "failure", "message": str(e)}), 500
 
 
 @app.route("/verify", methods=["POST"])
