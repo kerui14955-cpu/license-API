@@ -296,6 +296,8 @@ def check_update():
                 "size": manifest.get("size"),
                 "force": bool(manifest.get("force", False)),
                 "notes": manifest.get("notes", []),
+                "signature_algorithm": manifest.get("signature_algorithm"),
+                "signature": manifest.get("signature"),
                 "url_expires_in": UPDATE_URL_EXPIRE_SECONDS if download_url else 0,
             }
         ), 200
