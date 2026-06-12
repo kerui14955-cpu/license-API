@@ -1,4 +1,6 @@
 import os
+import base64
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -18,6 +20,7 @@ TENCENT_COS_REGION = os.environ.get("TENCENT_COS_REGION", "ap-shanghai")
 TENCENT_COS_BUCKET = os.environ.get("TENCENT_COS_BUCKET")
 TENCENT_COS_LATEST_KEY = os.environ.get("TENCENT_COS_LATEST_KEY", "updates/latest.json")
 UPDATE_URL_EXPIRE_SECONDS = int(os.environ.get("UPDATE_URL_EXPIRE_SECONDS", "600"))
+LICENSE_SIGNING_PRIVATE_KEY = os.environ.get("LICENSE_SIGNING_PRIVATE_KEY")
 LEGACY_CLIENT_KEYS = {
     value.strip()
     for value in [
@@ -31,6 +34,9 @@ LEGACY_CLIENT_KEYS = {
 AUTH_ADMIN = "admin"
 AUTH_CLIENT = "client"
 AUTH_LEGACY = "legacy"
+
+_LICENSE_PRIVATE_KEY = None
+_LICENSE_PRIVATE_KEY_LOADED = False
 
 
 def get_cos_client():
@@ -177,6 +183,70 @@ def get_hwid_candidates(data):
     if not isinstance(old_hwid_candidates, list):
         old_hwid_candidates = []
     return [value for value in [old_hwid, *old_hwid_candidates] if value]
+
+
+def b64url_encode(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def b64url_decode(value):
+    value = str(value).encode("ascii")
+    padding = b"=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def get_license_private_key():
+    global _LICENSE_PRIVATE_KEY, _LICENSE_PRIVATE_KEY_LOADED
+    if _LICENSE_PRIVATE_KEY_LOADED:
+        return _LICENSE_PRIVATE_KEY
+
+    _LICENSE_PRIVATE_KEY_LOADED = True
+    if not LICENSE_SIGNING_PRIVATE_KEY:
+        return None
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    key_text = LICENSE_SIGNING_PRIVATE_KEY.strip().replace("\\n", "\n")
+    if key_text.startswith("-----BEGIN"):
+        _LICENSE_PRIVATE_KEY = serialization.load_pem_private_key(key_text.encode("utf-8"), password=None)
+    else:
+        _LICENSE_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b64url_decode(key_text))
+    return _LICENSE_PRIVATE_KEY
+
+
+def make_license_token(license_key, hwid, script_id, expires_at, app_version=None):
+    private_key = get_license_private_key()
+    if not private_key:
+        return None
+
+    payload = {
+        "v": 2,
+        "license_hash": hashlib.sha256(str(license_key).encode("utf-8")).hexdigest(),
+        "hwid": hwid,
+        "script_id": str(script_id),
+        "expires_at": expires_at,
+        "issued_at": iso_z(datetime.now(timezone.utc)),
+    }
+    if app_version:
+        payload["app_version"] = str(app_version)
+
+    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_b64 = b64url_encode(payload_bytes)
+    signature = private_key.sign(payload_b64.encode("ascii"))
+    return f"v2.{payload_b64}.{b64url_encode(signature)}"
+
+
+def attach_license_token(message, license_key, hwid, script_id, app_version=None):
+    if message.get("status") != "success" or not message.get("expires_at"):
+        return message
+    try:
+        token = make_license_token(license_key, hwid, script_id, message["expires_at"], app_version=app_version)
+        if token:
+            message["license_token"] = token
+    except Exception as exc:
+        print(f"License token signing skipped: {exc}")
+    return message
 
 
 # ===================================================================
@@ -426,6 +496,7 @@ def verify_key():
                     "expires_at": iso_z(expires_at),
                 }
 
+        attach_license_token(message, key, hwid, script_id, app_version=app_version)
         return jsonify(message), 200
 
     except Exception as e:
